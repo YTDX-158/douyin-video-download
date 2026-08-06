@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 虚拟环境
+scripts/venv/
+venv/
+.venv/
+
+# 下载产物（视频 / 图集 / 互动数据）
+*.mp4
+*.jpg
+*.jpeg
+*.png
+*.webp
+互动数据.md
+
+# macOS
+.DS_Store

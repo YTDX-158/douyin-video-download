@@ -30,6 +30,14 @@ import string
 import sys
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
+
+# 防 GBK 崩（Windows 后台/管道重定向运行）：强制 UTF-8 输出，emoji+中文都能打
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry

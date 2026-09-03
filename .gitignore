@@ -16,5 +16,8 @@ venv/
 *.webp
 互动数据.md
 
+# 运行时缓存（抖音 cookie，含会话凭证——不入 git）
+.douyin_cookies.json
+
 # macOS
 .DS_Store

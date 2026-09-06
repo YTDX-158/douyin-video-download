@@ -19,5 +19,8 @@ venv/
 # 运行时缓存（抖音 cookie，含会话凭证——不入 git）
 .douyin_cookies.json
 
+# B站登录 cookie（账号凭证——不入 git；SESSDATA 约半月过期）
+scripts/bilibili_cookies.txt
+
 # macOS
 .DS_Store

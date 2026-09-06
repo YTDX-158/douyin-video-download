@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-解析抖音/快手分享链接，下载无水印视频/图集
+解析抖音/快手/小红书分享链接，下载无水印视频/图集
 
-平台支持（2026-08-18 更新）：
+平台支持（2026-09-06 更新）：
   ✅ 抖音（v.douyin.com / www.iesdouyin.com / www.douyin.com）
   ✅ 快手（v.kuaishou.com）
+  ✅ 小红书（xhslink.cn / xhslink.com 短链，www.xiaohongshu.com 页面直链）
 
 抖音反爬处理（2026-08-12 更新）：
   抖音反爬升级 —— 对纯脚本请求（手机/电脑 UA 都试过）返回「验证码中间页」，
@@ -19,6 +20,12 @@
 快手解析（2026-08-18 新增）：
   快手短链跟随重定向 → 抓页面 Relay 数据 → 提取视频地址（photo-video-mz 高清）
   + 标题 + 作者 + 点赞/播放。快手网页版只暴露点赞和播放，无评论/收藏/转发。
+
+小红书解析（2026-09-06 新增，纯 requests 无浏览器兜底）：
+  分享短链(xhslink)跟随重定向 → 最终 URL 自带 xsec_token（单页数据通行证）→
+  页面 window.__INITIAL_STATE__ 服务端渲染出完整数据：视频走 video.media.stream.h264
+  多档取最高清，图文走 imageList；标题/作者/点赞/收藏/评论/转发同取。
+  ⚠️ 互动数是中文缩写字符串（'5万'/'999+'）原样展示；下载 CDN 需 xiaohongshu.com Referer。
 """
 
 import argparse
@@ -758,6 +765,165 @@ def parse_kuaishou(share_url, session):
     return result
 
 
+def extract_xhs_note_from_html(html):
+    """从小红书页面 HTML 的 window.__INITIAL_STATE__ 提取笔记数据 note。
+
+    2026-09-06 实测结论（纯 requests，无浏览器兜底）：
+    - 分享短链(xhslink)展开后的完整 URL 自带 xsec_token —— 这是解锁单页完整数据的通行证，
+      服务端把笔记数据（视频源/标题/作者/互动）整个渲染进 __INITIAL_STATE__。
+    - __INITIAL_STATE__ 是 JS 全局态直拼页面，内含裸 undefined（非合法 JSON）→ 先替换成 null。
+    - 内容可能带 HTML 实体（&amp; 等）→ 先 html.unescape 再解析（对无实体串幂等无害）。
+    """
+    import html as html_module
+    m = re.search(r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*</script>', html, re.DOTALL)
+    if not m:
+        raise Exception('页面未找到笔记数据（__INITIAL_STATE__）。\n  可能原因：直链缺 xsec_token / 被风控 / 需登录。\n  请用 App 里的「复制链接」分享（xhslink 开头的短链）再试。')
+    raw = html_module.unescape(m.group(1))
+    # 裸 undefined → null（实测 20+ 处，多见于前端全局态字段）
+    raw = re.sub(r':\s*undefined', ':null', raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        raise Exception('笔记数据解析失败（小红书页面结构可能已变更，需更新脚本）')
+    note_map = (data.get('note') or {}).get('noteDetailMap') or {}
+    note = None
+    for _k, v in note_map.items():
+        if isinstance(v, dict) and isinstance(v.get('note'), dict):
+            note = v['note']
+            break
+    if not note:
+        raise Exception('笔记数据为空（视频已删除 / 私密 / 需登录？）')
+    return note
+
+
+def xhs_image_url(item):
+    """小红书图文取原图直链（绕过 sns-webpic-qc 水印/压缩层，2026-09-06 实测）。
+
+    实测：urlDefault(qc 层) 同图仅 ~293KB 且带水印；fileId 拼 ci.xiaohongshu.com 直链 = 5.5MB 原图。
+    优先级：fileId 全路径拼 ci → traceId（fileId 空时）→ urlDefault 兜底。
+    ci 直链 URL 无扩展名，下载时按 content-type 定 .png/.jpg/.webp（见 main 图集段）。
+    """
+    fid = (item.get('fileId') or '').strip()
+    if fid:
+        return f'https://ci.xiaohongshu.com/{fid}'
+    tid = (item.get('traceId') or '').strip()
+    if tid:
+        return f'https://ci.xiaohongshu.com/{tid}'
+    ud = item.get('urlDefault') or ''
+    if ud.startswith('http://'):
+        ud = 'https://' + ud[len('http://'):]
+    return ud
+
+
+def xhs_live_url(item):
+    """小红书实况图(live)的视频源：livePhoto.media.stream.h264 优先，旧版兜底 item.stream.h264。
+    取最高清档 masterUrl（统一 https）。无 live 返回空串。
+    """
+    for holder in [item.get('livePhoto'), item]:
+        if not isinstance(holder, dict):
+            continue
+        cand = holder
+        media = holder.get('media')
+        if isinstance(media, dict) and isinstance(media.get('stream'), dict):
+            cand = media
+        streams = (cand.get('stream') or {}).get('h264') or []
+        if isinstance(cand.get('h264'), list):
+            streams = cand['h264'] or streams
+        best = None
+        for s in streams:
+            if not isinstance(s, dict):
+                continue
+            if best is None or (s.get('width') or 0) > (best.get('width') or 0):
+                best = s
+        if best:
+            mu = best.get('masterUrl') or ''
+            if mu.startswith('http://'):
+                mu = 'https://' + mu[len('http://'):]
+            return mu
+    return ''
+
+
+def parse_xhs(share_url, session):
+    """解析小红书分享链接（xhslink.cn/xhslink.com 短链，或 xiaohongshu.com 页面直链）→ 标准 result 格式。
+
+    流程（2026-09-06 实测）：
+    1. xhslink 短链 → requests 跟随重定向 → 最终 URL 自带 xsec_token（requests 自动跟随，
+       resp.text 即最终页面，一次 GET 搞定）
+    2. 从 __INITIAL_STATE__ 拿 note：视频走 video.media.stream.h264 多档取最高清，
+       图文走 imageList；标题/作者/互动数据同取
+    3. platform='xhs'，下载时带 xiaohongshu.com Referer（实测 CDN 校验 Referer）
+    """
+    ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+    resp = session.get(share_url, headers={'User-Agent': ua}, timeout=30, allow_redirects=True)
+    if not resp.ok:
+        raise Exception(f'小红书请求失败: {resp.status_code}')
+    note = extract_xhs_note_from_html(resp.text)
+    note_id = note.get('noteId') or 'note'
+    note_type = note.get('type', '')          # video=视频笔记；normal/image=图文
+    is_video = note_type == 'video'
+
+    # 作者
+    user = note.get('user') or {}
+    avatar = user.get('avatar', '')
+    if isinstance(avatar, dict):
+        avatar = avatar.get('url') or avatar.get('urlDefault') or ''
+
+    # 视频源：video.media.stream.h264[] 多档清晰度 → 取 width 最大（最清）档
+    video_url = ''
+    if is_video:
+        media = (note.get('video') or {}).get('media') or {}
+        streams = (media.get('stream') or {}).get('h264') or []
+        best = None
+        for s in streams:
+            if not isinstance(s, dict):
+                continue
+            if best is None or (s.get('width') or 0) > (best.get('width') or 0):
+                best = s
+        if best:
+            mu = best.get('masterUrl') or ''
+            if mu.startswith('http://'):
+                mu = 'https://' + mu[len('http://'):]   # CDN http/https 都通，统一 https（实测 206）
+            video_url = mu
+
+    # 图文：imageList 原图（ci 直链绕过 qc 水印层）+ 实况图视频（livePhoto/stream）
+    images = []
+    if not is_video:
+        for item in note.get('imageList') or []:
+            if not isinstance(item, dict):
+                continue
+            url = xhs_image_url(item)
+            if url:
+                images.append({'url': url, 'live_photo_url': xhs_live_url(item)})
+
+    # 互动数据：小红书是中文缩写字符串（'5万' / '999+'）→ 原样保留，不做 int 转换
+    it = note.get('interactInfo') or {}
+    statistics = {
+        'digg_count': it.get('likedCount', 0),
+        'collect_count': it.get('collectedCount', 0),
+        'comment_count': it.get('commentCount', 0),
+        'share_count': it.get('shareCount', 0),
+    }
+
+    result = {
+        'title': note.get('title') or note.get('desc') or '',
+        'video_url': video_url,
+        'cover_url': '',                       # 封面未在 note 顶层，暂不强求（可后续从 video.image 挖）
+        'images': images,
+        'author': {
+            'uid': str(user.get('userId', '')),
+            'name': user.get('nickname', ''),
+            'avatar': avatar,
+        },
+        'statistics': statistics,
+        'platform': 'xhs',
+        'video_id': note_id,
+    }
+
+    if not result['video_url'] and not result['images']:
+        raise Exception('未解析到视频或图片。\n  可能笔记已删除 / 私密，或页面数据不完整——试试 App 里重新复制链接。')
+    return result
+
+
 def parse_share_url(share_url, session):
     """解析分享链接（自动识别抖音 / 快手）"""
     parsed_url = urlparse(share_url)
@@ -772,15 +938,26 @@ def parse_share_url(share_url, session):
         return parse_app_share_url(share_url, session)
     elif host == 'v.kuaishou.com' or 'kuaishou.com' in host:
         return parse_kuaishou(share_url, session)
+    elif host in ['xhslink.cn', 'xhslink.com'] or 'xiaohongshu.com' in host:
+        return parse_xhs(share_url, session)
     else:
         raise Exception(f"不支持的域名: {host}")
+
+
+# CDN Referer 校验映射：抖音 douyinvod 校 douyin.com，快手 kwaicdn 校 kuaishou.com，
+# 小红书 sns-video xhscdn 校 xiaohongshu.com（实测不带对应 Referer 会 403 / 拒下）
+PLATFORM_REFERERS = {
+    'douyin': 'https://www.douyin.com/',
+    'kuaishou': 'https://www.kuaishou.com/',
+    'xhs': 'https://www.xiaohongshu.com/',
+}
 
 
 def download_hls_stream(m3u8_url, output_path, session, platform='kuaishou', file_type='视频'):
     """下载 HLS(m3u8) 分段流并拼接成 mp4（快手偶发 HLS 源，2026-09-03 补）。
     m3u8 里是 .ts 段（无 KEY 加密可直接纯拼接）；带加密则报错提示。
     """
-    referer = 'https://www.kuaishou.com/' if platform == 'kuaishou' else 'https://www.douyin.com/'
+    referer = PLATFORM_REFERERS.get(platform, PLATFORM_REFERERS['douyin'])
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
         'Referer': referer,
@@ -820,7 +997,7 @@ def download_file(url, output_path, session, file_type='文件', platform='douyi
     if '.m3u8' in url.lower():
         return download_hls_stream(url, output_path, session, platform, file_type)
 
-    referer = 'https://www.kuaishou.com/' if platform == 'kuaishou' else 'https://www.douyin.com/'
+    referer = PLATFORM_REFERERS.get(platform, PLATFORM_REFERERS['douyin'])
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
         'Referer': referer,
@@ -842,6 +1019,28 @@ def download_file(url, output_path, session, file_type='文件', platform='douyi
     
     print()  # 换行
     return output_path
+
+
+def probe_image_ext(session, url):
+    """URL 无扩展名时探测真实图片格式（stream 读前 16 字节看 magic，比 content-type 可靠——实测
+    ci CDN 的 content-type 对后续请求会失真）。小红书 ci.xiaohongshu.com 原图直链用它。2026-09-06。
+    """
+    try:
+        r = session.get(url, headers={
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            'Referer': PLATFORM_REFERERS['xhs'],
+        }, stream=True, timeout=15)
+        head = next(r.iter_content(16), b'') if r.ok else b''
+        r.close()
+        if head[:4] == b'\x89PNG':
+            return '.png'
+        if head[:2] == b'\xff\xd8':
+            return '.jpg'
+        if head[:4] == b'RIFF' and head[8:12] == b'WEBP':
+            return '.webp'
+        return '.jpg'
+    except Exception:
+        return '.jpg'
 
 
 def sanitize_title_for_dir(title, fallback='video', max_len=50):
@@ -868,13 +1067,15 @@ def sanitize_title_for_dir(title, fallback='video', max_len=50):
 
 def write_statistics_file(stats_file, share_url, video_id, result):
     """把互动数据写入 Markdown 文件（与视频同目录）。
-    抖音：点赞/收藏/评论/转发；快手：点赞/播放（快手网页不暴露评论收藏转发 → 标未提供）。
+    抖音：点赞/收藏/评论/转发；快手：点赞/播放（快手网页不暴露评论收藏转发 → 标未提供）；
+    小红书：点赞/收藏/评论/转发（值为中文缩写如 '5万'，原样展示）。
     """
     from datetime import date
     st = result.get('statistics', {}) or {}
     author = result.get('author', {}) or {}
     platform = result.get('platform', 'douyin')
-    platform_label = '快手' if platform == 'kuaishou' else '抖音'
+    label_map = {'kuaishou': '快手', 'xhs': '小红书'}
+    platform_label = label_map.get(platform, '抖音')
     lines = [
         f"# {author.get('name', '未知作者')} · {platform_label}视频互动数据",
         '',
@@ -895,16 +1096,16 @@ def write_statistics_file(stats_file, share_url, video_id, result):
     else:
         lines.append(f"| ⭐ 收藏 | {st.get('collect_count', 0)} |")
     lines += [
-        f"| 💬 评论 | {st.get('comment_count', 0) if platform == 'douyin' else '未提供'} |",
-        f"| 🔁 转发 | {st.get('share_count', 0) if platform == 'douyin' else '未提供'} |",
+        f"| 💬 评论 | {st.get('comment_count', 0) if platform in ('douyin', 'xhs') else '未提供'} |",
+        f"| 🔁 转发 | {st.get('share_count', 0) if platform in ('douyin', 'xhs') else '未提供'} |",
         '',
     ]
     stats_file.write_text('\n'.join(lines), encoding='utf-8')
 
 
 def main():
-    parser = argparse.ArgumentParser(description='解析抖音/快手分享链接，下载无水印视频/图集')
-    parser.add_argument('url', type=str, help='抖音/快手分享链接')
+    parser = argparse.ArgumentParser(description='解析抖音/快手/小红书分享链接，下载无水印视频/图集')
+    parser.add_argument('url', type=str, help='抖音/快手/小红书分享链接（小红书用 App 复制的 xhslink 短链最稳）')
     parser.add_argument('--output-dir', type=str, default=None, help='输出目录。在 skill 目录执行时默认落到项目根的 <标题>/（标题不可用时回退到视频ID）；否则用当前目录下的 downloads/')
     parser.add_argument('--images', action='store_true', help='下载图集图片（默认视频/图集自动识别）')
     
@@ -970,6 +1171,8 @@ def main():
         if auto_base is None and args.output_dir is None:
             if result.get('platform') == 'kuaishou':
                 auto_base = Path(r'D:\Claude_Files\003_资源库\快手素材')
+            elif result.get('platform') == 'xhs':
+                auto_base = Path(r'D:\Claude_Files\003_资源库\小红书素材')
             else:
                 auto_base = Path(r'D:\Claude_Files\003_资源库\抖音素材')
 
@@ -1017,14 +1220,16 @@ def main():
             print(f'正在下载图集 ({len(images)} 张)...')
             for index, image in enumerate(images):
                 img_url = image['url']
-                # 从 URL 中提取扩展名，默认 .jpg
-                ext = '.jpg'
+                # 从 URL 中提取扩展名；无扩展名（小红书 ci 原图直链）→ HEAD 按 content-type 定
+                ext = None
                 parsed_img = urlparse(img_url)
                 path_lower = parsed_img.path.lower()
                 for e in ['.jpg', '.jpeg', '.png', '.webp']:
                     if path_lower.endswith(e):
                         ext = e
                         break
+                if ext is None:
+                    ext = probe_image_ext(session, img_url)
                 
                 img_filename = f"{video_id}_{index+1:02d}{ext}"
                 img_path = output_dir / img_filename

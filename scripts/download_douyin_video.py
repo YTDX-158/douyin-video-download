@@ -646,6 +646,86 @@ def parse_pc_share_url(share_url, session):
     return parse_video_id(video_id, session)
 
 
+def _kuaishou_mobile_page(share_url, session):
+    """手机端页面兜底（2026-09-19 新增）
+
+    背景（实测）：部分快手作品在【电脑 UA】页面里根本没有 photo-video-mz /
+    adaptationSet 结构 —— 电脑 UA 落到 www.kuaishou.com/short-video/{id}
+    （约 75KB，Apollo 数据），而【手机 UA】落到
+    v.m.chenzhongtech.com/fw/long-video/{id}（约 186KB），数据是全的。
+    触发样本：v.kuaishou.com/KDMMW4b5（photoType=VIDEO，但 PC 页面无视频数据）。
+    电脑 UA 那条路取不到地址时，用它兜底。
+
+    只读、不抛异常：整体失败返回 None。
+    """
+    ua = ('Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) '
+          'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1')
+    try:
+        resp = session.get(share_url, headers={'User-Agent': ua}, timeout=30, allow_redirects=True)
+        if not resp.ok:
+            return None
+        html = resp.text
+    except Exception:
+        return None
+
+    def _unescape(s):
+        """只还原 \\uXXXX 转义。
+        ⚠️ 不要对含中文的串用 .encode().decode('unicode_escape')：那会把 UTF-8
+        字节当 latin-1 解码，中文全变乱码（2026-09-19 亲手踩过，标题/作者全毁）。"""
+        return re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), s)
+
+    out = {'video_url': '', 'video_src': ''}
+
+    m = re.search(r'photoId=([A-Za-z0-9]+)', resp.url) or \
+        re.search(r'/(?:long-video|short-video)/([A-Za-z0-9]+)', resp.url)
+    if m:
+        out['photo_id'] = m.group(1)
+
+    m = re.search(r'"caption":"(.*?)","', html)
+    if m:
+        out['title'] = _unescape(m.group(1))
+
+    # 视频地址：优先 upic 直链（avc/H.264，兼容性最好且码率更高），
+    # 回退 photo-video-mz（hd15 —— 实测这条是 hevc/H.265，留给解码环境好的场景）
+    for pat, src in ((r'"url":"(https://[^"]*?/upic/[^"]*?\.mp4[^"]*?)"', 'upic-avc'),
+                     (r'"url":"(https://[^"]*?/photo-video-mz/[^"]*?\.mp4[^"]*?)"', 'photo-video-mz')):
+        m = re.search(pat, html)
+        if m:
+            out['video_url'] = _unescape(m.group(1))
+            out['video_src'] = src
+            break
+
+    m = re.search(r'"coverUrl":"(.*?)","', html)
+    if m:
+        out['cover_url'] = _unescape(m.group(1))
+
+    for pat in (r'"userName":"(.*?)"', r'"name":"(.*?)","following"'):
+        m = re.search(pat, html)
+        if m:
+            out['author_name'] = _unescape(m.group(1))
+            break
+
+    m = re.search(r'"headerUrl":"(.*?)"', html)
+    if m:
+        out['author_avatar'] = _unescape(m.group(1))
+
+    # 互动数据：手机页面比 PC 页面全（PC 只有点赞，这里点赞/评论/收藏/转发/播放都有）
+    # ⚠️ 字段含义已验证（2026-09-19）：viewCount 实测 = 303368，与本条分享文案标注的
+    #    "该作品被播放过 29.1 万次"吻合（同一条作品，数字随播放增长）
+    #    → 确认为【单条作品】数据；旁证：2.4万赞 / 30万播放 ≈ 8% 点赞率，比例正常。
+    #    故同组的 likeCount / commentCount 等亦为作品级，不是作者累计值。
+    for field, key in (('likeCount', 'like_count'),
+                       ('commentCount', 'comment_count'),
+                       ('collectionCount', 'collect_count'),
+                       ('shareCount', 'share_count'),
+                       ('viewCount', 'view_count')):
+        m = re.search(rf'"{field}":\s*(\d+)', html)
+        if m:
+            out[key] = int(m.group(1))
+
+    return out
+
+
 def parse_kuaishou(share_url, session):
     """解析快手分享链接（v.kuaishou.com 短链）→ 返回标准 result 格式。
 
@@ -705,6 +785,21 @@ def parse_kuaishou(share_url, session):
     if video_url:
         video_url = video_url.encode().decode('unicode_escape')
 
+    # 4.5 兜底（2026-09-19 新增）：电脑 UA 页面扑空 → 改走手机端页面
+    #     部分作品（图文/幻灯片类，实测 v.kuaishou.com/KDMMW4b5）PC 页面不含
+    #     photo-video-mz / adaptationSet，只有手机端 v.m.chenzhongtech.com 页面才有。
+    mobile_fb = None
+    if not video_url:
+        mobile_fb = _kuaishou_mobile_page(share_url, session)
+        if mobile_fb:
+            video_url = mobile_fb.get('video_url', '')
+            if video_url:
+                print(f"  ↩ 电脑端页面无视频数据，已改走手机端页面（源: {mobile_fb.get('video_src')}）")
+            if not title and mobile_fb.get('title'):
+                title = mobile_fb['title']
+            if not photo_id and mobile_fb.get('photo_id'):
+                photo_id = mobile_fb['photo_id']
+
     # 5. 封面
     cover_url = ''
     m = re.search(r'"coverUrl":"(.*?)","', html)
@@ -736,11 +831,33 @@ def parse_kuaishou(share_url, session):
     if m:
         view_count = m.group(1)
 
+    # 7.5 手机端兜底补齐（2026-09-19）：PC 页面取不到的字段，用手机页面的值填。
+    #     PC 页面只有点赞；手机页面点赞/评论/收藏/转发/播放是整套 → 补齐后数据更完整。
+    collect_count = 0
+    comment_count = 0
+    share_count = 0
+    if mobile_fb:
+        if not author_name:
+            author_name = mobile_fb.get('author_name', '')
+        if not author_avatar:
+            author_avatar = mobile_fb.get('author_avatar', '')
+        if not like_count and mobile_fb.get('like_count'):
+            like_count = mobile_fb['like_count']
+        if not collect_count and mobile_fb.get('collect_count'):
+            collect_count = mobile_fb['collect_count']
+        if not comment_count and mobile_fb.get('comment_count'):
+            comment_count = mobile_fb['comment_count']
+        if not share_count and mobile_fb.get('share_count'):
+            share_count = mobile_fb['share_count']
+        if not view_count and mobile_fb.get('view_count'):
+            # 统一成字符串，与 PC 路径（"36万" 这类）保持同型，免得下游格式化踩坑
+            view_count = str(mobile_fb['view_count'])
+
     statistics = {
         'digg_count': like_count,
-        'collect_count': 0,
-        'comment_count': 0,
-        'share_count': 0,
+        'collect_count': collect_count,
+        'comment_count': comment_count,
+        'share_count': share_count,
         'view_count': view_count,   # 快手特有：播放量
     }
 

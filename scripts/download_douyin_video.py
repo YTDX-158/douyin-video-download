@@ -26,6 +26,10 @@
   页面 window.__INITIAL_STATE__ 服务端渲染出完整数据：视频走 video.media.stream.h264
   多档取最高清，图文走 imageList；标题/作者/点赞/收藏/评论/转发同取。
   ⚠️ 互动数是中文缩写字符串（'5万'/'999+'）原样展示；下载 CDN 需 xiaohongshu.com Referer。
+
+  2026-09-19 更新（两处，都是实测踩出来的）：
+  - 电脑 UA 会被重定向到 /login 登录页（页面无笔记数据）→ 扑空时自动改走手机 UA
+  - 页面结构改版：note.noteDetailMap → noteData.data.noteData；作者 nickname → nickName
 """
 
 import argparse
@@ -890,6 +894,8 @@ def extract_xhs_note_from_html(html):
       服务端把笔记数据（视频源/标题/作者/互动）整个渲染进 __INITIAL_STATE__。
     - __INITIAL_STATE__ 是 JS 全局态直拼页面，内含裸 undefined（非合法 JSON）→ 先替换成 null。
     - 内容可能带 HTML 实体（&amp; 等）→ 先 html.unescape 再解析（对无实体串幂等无害）。
+    - 2026-09-19 实测：页面结构已改版，笔记对象路径从 note.noteDetailMap[noteId].note
+      变为 noteData.data.noteData；作者字段从 nickname 变为 nickName。本函数两套都兼容。
     """
     import html as html_module
     m = re.search(r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*</script>', html, re.DOTALL)
@@ -902,12 +908,21 @@ def extract_xhs_note_from_html(html):
         data = json.loads(raw)
     except json.JSONDecodeError:
         raise Exception('笔记数据解析失败（小红书页面结构可能已变更，需更新脚本）')
-    note_map = (data.get('note') or {}).get('noteDetailMap') or {}
+
+    # 定位 note —— 两套结构都试（新版优先）
     note = None
-    for _k, v in note_map.items():
-        if isinstance(v, dict) and isinstance(v.get('note'), dict):
-            note = v['note']
-            break
+    try:
+        cand = data['noteData']['data']['noteData']
+        if isinstance(cand, dict) and cand.get('noteId'):
+            note = cand
+    except (KeyError, TypeError):
+        pass
+    if not note:
+        note_map = (data.get('note') or {}).get('noteDetailMap') or {}
+        for _k, v in note_map.items():
+            if isinstance(v, dict) and isinstance(v.get('note'), dict):
+                note = v['note']
+                break
     if not note:
         raise Exception('笔记数据为空（视频已删除 / 私密 / 需登录？）')
     return note
@@ -974,7 +989,23 @@ def parse_xhs(share_url, session):
     resp = session.get(share_url, headers={'User-Agent': ua}, timeout=30, allow_redirects=True)
     if not resp.ok:
         raise Exception(f'小红书请求失败: {resp.status_code}')
-    note = extract_xhs_note_from_html(resp.text)
+    try:
+        note = extract_xhs_note_from_html(resp.text)
+    except Exception as e_pc:
+        # 2026-09-19 新增：电脑 UA 会被重定向到 /login 登录页（该页无笔记数据）
+        # → 改走手机 UA 再试一次（实测手机 UA 直达笔记页，__INITIAL_STATE__ 数据完整）
+        ua_phone = ('Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) '
+                    'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1')
+        note = None
+        try:
+            resp2 = session.get(share_url, headers={'User-Agent': ua_phone}, timeout=30, allow_redirects=True)
+            if resp2.ok:
+                note = extract_xhs_note_from_html(resp2.text)
+        except Exception:
+            note = None
+        if not note:
+            raise e_pc
+        print("  ↩ 电脑端被跳登录页，已改走手机端页面")
     note_id = note.get('noteId') or 'note'
     note_type = note.get('type', '')          # video=视频笔记；normal/image=图文
     is_video = note_type == 'video'
@@ -1028,7 +1059,7 @@ def parse_xhs(share_url, session):
         'images': images,
         'author': {
             'uid': str(user.get('userId', '')),
-            'name': user.get('nickname', ''),
+            'name': user.get('nickName') or user.get('nickname', ''),   # 新版 nickName / 旧版 nickname
             'avatar': avatar,
         },
         'statistics': statistics,

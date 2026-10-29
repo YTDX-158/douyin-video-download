@@ -65,6 +65,18 @@ _COOKIE_TTL = 7 * 24 * 3600
 _playwright = None
 _browser = None
 
+# ⭐ 2026-10-29：浏览器兜底的重试参数（压测 6 链接实测：2 个首次超时，重试 1 次即过）
+RETRY_ROUNDS = 2              # 总尝试轮数（1 次原试 + 1 次重试）
+GOTO_TIMEOUT_MS = 30000       # 第 1 轮超时
+GOTO_TIMEOUT_MS_RETRY = 45000  # 第 2 轮放宽——超时十有八九是网络慢，不是页面坏
+
+
+def page_wait_backoff(attempt, base=3):
+    """重试前的退避等待（秒）：第 1 次失败等 base 秒，之后翻倍。"""
+    wait = base * (2 ** (attempt - 1))
+    print(f'⏳ 等待 {wait}s 后重试…')
+    _time.sleep(wait)
+
 
 def load_saved_cookies():
     """读缓存 cookie（带时间戳；超期返回空让浏览器重种）"""
@@ -474,54 +486,68 @@ def fetch_via_browser_data(video_id, session):
         raise Exception('浏览器兜底需要 playwright。请先安装：pip install playwright && playwright install chromium')
 
     aweme_detail = {}
-    context = _make_context()  # 单例浏览器 + 桌面 UA + 带入缓存 cookie
-    try:
-        page = context.new_page()
+    # ⭐ 2026-10-29：加重试。压测 6 个链接实测 2 个首次撞 `Page.goto: Timeout 30000ms exceeded`，
+    #    原样重试 1 次就过。⚠️ 关键：失败时 finally 里 context.close() 已经把上下文废掉了，
+    #    所以重试必须【重建 context】，不能只重包 page.goto。
+    last_err = None
+    for attempt in range(1, RETRY_ROUNDS + 1):
+        timeout_ms = GOTO_TIMEOUT_MS if attempt == 1 else GOTO_TIMEOUT_MS_RETRY
+        context = _make_context()  # 单例浏览器 + 桌面 UA + 带入缓存 cookie
+        try:
+            page = context.new_page()
 
-        # 监听必须在第一次导航之前注册——否则页面加载时 detail API 已返回，会漏掉。
-        def on_response(resp):
-            """监听网络响应，从详情接口里抓 aweme_detail"""
-            nonlocal aweme_detail
+            # 监听必须在第一次导航之前注册——否则页面加载时 detail API 已返回，会漏掉。
+            def on_response(resp):
+                """监听网络响应，从详情接口里抓 aweme_detail"""
+                nonlocal aweme_detail
+                try:
+                    if 'aweme/v1' in resp.url or 'aweme/detail' in resp.url:
+                        body = resp.json()
+                        detail = body.get('aweme_detail') or body.get('aweme') or {}
+                        if detail:
+                            aweme_detail = detail
+                except Exception:
+                    pass
+
+            page.on('response', on_response)
+
+            # 第1步：有缓存 cookie 就跳过逛首页；没有则先访问首页种 cookie（绕验证码中间页）
+            if not load_saved_cookies():
+                try:
+                    print('🌐 浏览器先访问抖音首页种 cookie')
+                    page.goto('https://www.douyin.com/', wait_until='domcontentloaded', timeout=timeout_ms)
+                    page.wait_for_timeout(3000)
+                except Exception:
+                    pass  # 首页打不开没关系，继续进视频页
+
+            # 第2步：访问视频页，抓详情接口数据
+            page_url = f'https://www.douyin.com/video/{video_id}'
+            print(f'🌐 [浏览器·第{attempt}/{RETRY_ROUNDS}轮] 打开: {page_url}（超时 {timeout_ms // 1000}s）')
+            page.goto(page_url, wait_until='domcontentloaded', timeout=timeout_ms)
+            # 等网络响应落地（页面加载 / 可能的验证码需要几秒）
+            page.wait_for_timeout(8000)
+
+            if aweme_detail:
+                break  # 拿到了，跳出重试
+            last_err = '页面打开了但没抓到详情接口数据'
+        except Exception as e:
+            last_err = str(e)
+            if attempt < RETRY_ROUNDS:
+                print(f'⚠️ [浏览器·第{attempt}轮] 失败: {last_err} —— 重建上下文重试')
+                page_wait_backoff(attempt)
+        finally:
             try:
-                if 'aweme/v1' in resp.url or 'aweme/detail' in resp.url:
-                    body = resp.json()
-                    detail = body.get('aweme_detail') or body.get('aweme') or {}
-                    if detail:
-                        aweme_detail = detail
+                save_cookies(context.cookies())  # 种好的 cookie 落盘，下次 requests 直接复用
+            except Exception:
+                pass
+            try:
+                context.close()
             except Exception:
                 pass
 
-        page.on('response', on_response)
-
-        # 第1步：有缓存 cookie 就跳过逛首页；没有则先访问首页种 cookie（绕验证码中间页）
-        if not load_saved_cookies():
-            try:
-                print('🌐 浏览器先访问抖音首页种 cookie')
-                page.goto('https://www.douyin.com/', wait_until='domcontentloaded', timeout=30000)
-                page.wait_for_timeout(3000)
-            except Exception:
-                pass  # 首页打不开没关系，继续进视频页
-
-        # 第2步：访问视频页，抓详情接口数据
-        page_url = f'https://www.douyin.com/video/{video_id}'
-        print(f'🌐 浏览器打开: {page_url}')
-        page.goto(page_url, wait_until='domcontentloaded', timeout=30000)
-        # 等网络响应落地（页面加载 / 可能的验证码需要几秒）
-        page.wait_for_timeout(8000)
-    except Exception as e:
-        raise Exception(f'浏览器兜底失败: {e}')
-    finally:
-        try:
-            save_cookies(context.cookies())  # 种好的 cookie 落盘，下次 requests 直接复用
-        except Exception:
-            pass
-        try:
-            context.close()
-        except Exception:
-            pass
-
     if not aweme_detail:
-        raise Exception('浏览器方案也未获取到视频数据，可能视频已删除 / 私密，或需要人工打开链接处理验证码')
+        raise Exception(f'【浏览器·{RETRY_ROUNDS}轮全失败】最后一次错误: {last_err}。'
+                        f'可能视频已删除/私密，或需要人工打开链接处理验证码')
 
     return convert_aweme_to_result(aweme_detail, video_id, session)
 
@@ -571,8 +597,9 @@ def parse_video_id(video_id, session):
         data = extract_video_data_from_html(html, video_id)
         if not data:
             # 2026-08-12 起，抖音对纯脚本请求返回「验证码中间页」，HTML 里不再有视频数据。
-            # 切浏览器兜底方案：用 Playwright 真实浏览器打开页面，从网络响应里抓 aweme_detail。
-            print('⚠️ HTML 直接解析失败（大概率触发抖音验证码拦截），切换浏览器兜底方案...')
+            # ⭐ 2026-10-29 压测 6 个链接：HTML 直解析 6/6 全部无数据 ⇒ 这已是【常态】，不是异常。
+            #    故不再打 ⚠️ 吓人，改成中性提示；真正该关注的是下面的浏览器兜底。
+            print('ℹ️ [HTML] 无数据（2026-08 起为常态）→ 转浏览器兜底')
             return fetch_via_browser_data(video_id, session)
 
     if not data:
@@ -1166,6 +1193,14 @@ def download_file(url, output_path, session, file_type='文件', platform='douyi
                     print(f"\r下载进度: {percent:.1f}%", end='', flush=True)
     
     print()  # 换行
+    # ⭐ 2026-10-29：落盘校验 —— raise_for_status() 只管 HTTP，0 字节/写失败照样"成功"返回。
+    #    这里补一道：文件必须存在且 ≥1KB，否则明确报错，别让上层以为下到了。
+    try:
+        _sz = output_path.stat().st_size
+    except Exception:
+        raise Exception(f'【下载】{file_type}落盘失败：文件不存在 {output_path}')
+    if _sz < 1024:
+        raise Exception(f'【下载】{file_type}只有 {_sz} B（<1KB），疑似空文件 / 防盗链拦截：{output_path}')
     return output_path
 
 
@@ -1400,11 +1435,34 @@ def main():
                 write_statistics_file(stats_file, args.url, video_id, result)
                 print(f'互动数据已保存到: {stats_file}')
         
+        # ⭐ 2026-10-29：产物清单 —— 别只看打印，最后核一遍磁盘上到底有什么。
+        #    （当天踩过：判成功只 grep *.mp4，结果图集作品被误判成"没下到"）
+        try:
+            mp4s = sorted(output_dir.glob('*.mp4'))
+            imgs = [p for ext in ('*.jpg', '*.jpeg', '*.png', '*.webp') for p in output_dir.glob(ext)]
+            print('')
+            print('────── 产物清单 ──────')
+            print(f'  目录: {output_dir}')
+            print(f'  mp4 : {len(mp4s)} 个')
+            for p in mp4s:
+                print(f'        {p.stat().st_size:>12,} B  {p.name}')
+            print(f'  图片: {len(imgs)} 张')
+            if imgs:
+                _tot = sum(p.stat().st_size for p in imgs)
+                print(f'        合计 {_tot:,} B')
+            print('  ─────────────────────')
+            if not mp4s and not imgs:
+                print('  ⚠️ 目录里没有任何媒体文件 —— 虽然脚本没报错，但这是失败')
+            print('')
+
+        except Exception as _e:
+            print(f'（产物清单生成失败，不影响结果: {_e}）')
+
         # 输出JSON格式结果
         print('')
         print('JSON格式:')
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        
+
         return 0
         
     except Exception as e:
